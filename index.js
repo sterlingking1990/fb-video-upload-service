@@ -30,7 +30,7 @@ app.post('/facebook/upload-video', async (req, res) => {
 
     // 2️⃣ Start upload
     const startRes = await axios.post(
-      `https://graph.facebook.com/${FACEBOOK_API_VERSION}/${ad_account_id}/advideos`,
+      `https://graph.facebook.com/${FACEBOOK_API_VERSION}/act_${ad_account_id}/advideos`,
       {
         upload_phase: 'start',
         file_size: fileSize,
@@ -54,7 +54,7 @@ app.post('/facebook/upload-video', async (req, res) => {
       if (uploaded.toString() !== start_offset) continue;
 
       const transferRes = await axios.post(
-        `https://graph.facebook.com/${FACEBOOK_API_VERSION}/${ad_account_id}/advideos`,
+        `https://graph.facebook.com/${FACEBOOK_API_VERSION}/act_${ad_account_id}/advideos`,
         {
           upload_phase: 'transfer',
           upload_session_id,
@@ -76,7 +76,7 @@ app.post('/facebook/upload-video', async (req, res) => {
 
     // 4️⃣ Finish upload
     await axios.post(
-      `https://graph.facebook.com/${FACEBOOK_API_VERSION}/${ad_account_id}/advideos`,
+      `https://graph.facebook.com/${FACEBOOK_API_VERSION}/act_${ad_account_id}/advideos`,
       {
         upload_phase: 'finish',
         upload_session_id,

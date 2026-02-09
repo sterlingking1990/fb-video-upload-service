@@ -1,6 +1,8 @@
 import 'dotenv/config';
 import express from 'express';
 import axios from 'axios';
+import FormData from 'form-data';
+import { Readable } from 'stream';
 
 const app = express();
 app.use(express.json());
@@ -17,7 +19,7 @@ axios.defaults.timeout = 300_000;
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 const MAX_VIDEO_SIZE = 250 * 1024 * 1024;
-const CHUNK_SIZE = 1024 * 1024 * 4; // 4MB chunks
+const CHUNK_SIZE = 1024 * 1024 * 5; // 5MB chunks
 
 app.post('/facebook/upload-video', async (req, res) => {
   const { video_url, ad_account_id } = req.body;
@@ -33,7 +35,7 @@ app.post('/facebook/upload-video', async (req, res) => {
       console.log(`[Attempt ${attempt}] Uploading video for`, adAccountId);
 
       // 1️⃣ Get file size
-      const head = await axios.head(video_url);
+      const head = await axios.head(video_url, { timeout: 30000 });
       const fileSize = parseInt(head.headers['content-length'], 10);
 
       if (!fileSize || fileSize <= 0) {
@@ -47,6 +49,8 @@ app.post('/facebook/upload-video', async (req, res) => {
         });
       }
 
+      console.log(`File size: ${(fileSize / 1024 / 1024).toFixed(1)}MB`);
+
       // 2️⃣ Start upload session
       const startRes = await axios.post(
         `https://graph.facebook.com/${FACEBOOK_API_VERSION}/${adAccountId}/advideos`,
@@ -57,45 +61,65 @@ app.post('/facebook/upload-video', async (req, res) => {
         }
       );
 
-      const { upload_session_id, video_id } = startRes.data;
+      const { upload_session_id, video_id, start_offset, end_offset } = startRes.data;
       console.log('Upload session started:', upload_session_id);
+      console.log('Initial offset range:', start_offset, '-', end_offset);
 
-      // 3️⃣ Download video to buffer
-      console.log('Downloading video...');
-      const videoResponse = await axios.get(video_url, {
-        responseType: 'arraybuffer',
-        timeout: 300_000
-      });
+      // 3️⃣ Upload in chunks using Range requests
+      let currentOffset = parseInt(start_offset);
 
-      const videoBuffer = Buffer.from(videoResponse.data);
-      console.log(`Downloaded ${(videoBuffer.length / 1024 / 1024).toFixed(1)}MB`);
+      while (currentOffset < fileSize) {
+        const rangeEnd = Math.min(currentOffset + CHUNK_SIZE - 1, fileSize - 1);
+        
+        console.log(`Downloading chunk: bytes ${currentOffset}-${rangeEnd} (${((currentOffset / fileSize) * 100).toFixed(1)}%)`);
 
-      // 4️⃣ Upload in chunks
-      let startOffset = 0;
-
-      while (startOffset < videoBuffer.length) {
-        const endOffset = Math.min(startOffset + CHUNK_SIZE, videoBuffer.length);
-        const chunk = videoBuffer.slice(startOffset, endOffset);
-
-        console.log(`Uploading chunk: ${startOffset}-${endOffset} (${((endOffset / videoBuffer.length) * 100).toFixed(1)}%)`);
-
-        await axios.post(
-          `https://graph.facebook.com/${FACEBOOK_API_VERSION}/${adAccountId}/advideos`,
-          {
-            upload_phase: 'transfer',
-            upload_session_id,
-            start_offset: startOffset,
-            video_file_chunk: chunk.toString('base64'),
-            access_token: FACEBOOK_ACCESS_TOKEN
+        // Download this specific chunk
+        const chunkResponse = await axios.get(video_url, {
+          responseType: 'arraybuffer',
+          headers: {
+            'Range': `bytes=${currentOffset}-${rangeEnd}`
           },
-          { timeout: 120_000 }
+          timeout: 60000
+        });
+
+        const chunkBuffer = Buffer.from(chunkResponse.data);
+        
+        console.log(`Uploading ${chunkBuffer.length} bytes...`);
+
+        // Upload chunk using multipart/form-data
+        const formData = new FormData();
+        formData.append('upload_phase', 'transfer');
+        formData.append('upload_session_id', upload_session_id);
+        formData.append('start_offset', currentOffset.toString());
+        formData.append('video_file_chunk', chunkBuffer, {
+          filename: 'chunk',
+          contentType: 'application/octet-stream'
+        });
+
+        const transferRes = await axios.post(
+          `https://graph.facebook.com/${FACEBOOK_API_VERSION}/${adAccountId}/advideos`,
+          formData,
+          {
+            params: { access_token: FACEBOOK_ACCESS_TOKEN },
+            headers: formData.getHeaders(),
+            maxBodyLength: Infinity,
+            maxContentLength: Infinity,
+            timeout: 120000
+          }
         );
 
-        startOffset = endOffset;
-        await sleep(500); // Throttle between chunks
+        const newStartOffset = parseInt(transferRes.data.start_offset);
+        const newEndOffset = parseInt(transferRes.data.end_offset);
+        
+        console.log(`Chunk uploaded. New offset: ${newStartOffset}-${newEndOffset}`);
+
+        currentOffset = newStartOffset;
+
+        // Throttle to avoid rate limits
+        await sleep(1000);
       }
 
-      // 5️⃣ Finish upload
+      // 4️⃣ Finish upload
       console.log('Finishing upload...');
       await axios.post(
         `https://graph.facebook.com/${FACEBOOK_API_VERSION}/${adAccountId}/advideos`,
@@ -108,8 +132,8 @@ app.post('/facebook/upload-video', async (req, res) => {
 
       console.log('Upload finished, polling status…');
 
-      // 6️⃣ Poll status
-      for (let i = 0; i < 20; i++) {
+      // 5️⃣ Poll status
+      for (let i = 0; i < 30; i++) {
         await sleep(3000);
 
         const statusRes = await axios.get(
